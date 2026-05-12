@@ -1,0 +1,22 @@
+The client is requesting a Proof of Concept for an AI-driven compliance and operational intelligence platform for regulated medical devices, specifically portable temperature-controlled plasma transport units.
+
+The objective is to evaluate the feasibility of using multimodal large language models (VLLMs) to ingest, interpret, and validate heterogeneous data sources including regulatory documentation, engineering specifications, time-series sensor logs, alarm/event streams, operational telemetry, system dashboards, and blueprint or schematic images.
+
+The system should be capable of:
+
+extracting structured regulatory requirements from dense compliance documents
+mapping technical specifications against regulatory constraints and identifying gaps or contradictions
+analyzing time-series data (e.g., temperature, battery, sensor readings) from line and scatter plots to detect threshold violations, anomalies, and instability patterns
+interpreting system logs and event streams to reconstruct operational behavior and detect compliance violations, including delayed alarms, missing sensor redundancy, or telemetry gaps
+understanding engineering blueprints or system schematics to validate physical layout constraints such as sensor placement, airflow design, insulation requirements, and redundancy architecture
+correlating findings across multiple modalities (logs, charts, specifications, and diagrams) to produce root cause analysis and explainable compliance conclusions
+
+The expected output should include:
+
+a structured compliance report aligned with regulatory requirements
+identification of deviations, missing constraints, and ambiguous specifications
+temporal analysis of system behavior and event sequences
+explanation of detected violations with supporting evidence from logs and visual data
+a severity classification of issues based on regulatory impact
+
+The PoC should demonstrate how AI can function as an assistive compliance analyst capable of supporting engineering, quality assurance, and regulatory teams in high-stakes medical device environments.
