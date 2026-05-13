@@ -1,6 +1,8 @@
 import os
 import json
-from datetime import datetime
+import csv
+import io
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -9,6 +11,7 @@ from models import db, UploadedFile, AnalysisResult, Violation, LogEntry
 from log_analyzer import ComplianceAnalyzer
 from report_generator import ReportGenerator
 from compliance_rules import get_all_rules
+from gemini_client import GeminiClient
 
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -16,6 +19,9 @@ CORS(app)
 db.init_app(app)
 
 analyzer = ComplianceAnalyzer()
+# Allow GEMINI_MODEL to be a comma-separated list like "gemini-2.5-flash,gemini-2.0-flash"
+gemini_model_cfg = app.config.get('GEMINI_MODEL') or ''
+gemini_client = GeminiClient(app.config.get('GEMINI_API_KEY'), gemini_model_cfg)
 
 def allowed_file(filename):
     return '.' in filename and \
@@ -28,6 +34,15 @@ def get_file_type(filename):
     elif ext in ['png', 'jpg', 'jpeg']:
         return 'image'
     return 'unknown'
+
+
+def get_mime_type(filename):
+    ext = filename.rsplit('.', 1)[1].lower()
+    if ext == 'png':
+        return 'image/png'
+    if ext in ['jpg', 'jpeg']:
+        return 'image/jpeg'
+    return 'application/octet-stream'
 
 with app.app_context():
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -157,10 +172,120 @@ def analyze_file(file_id):
         })
     
     elif uploaded_file.file_type == 'image':
+        try:
+            mime_type = get_mime_type(uploaded_file.original_filename)
+            csv_output = gemini_client.analyze_image_as_csv(uploaded_file.file_path, mime_type=mime_type)
+        except Exception as exc:
+            return jsonify({
+                'success': False,
+                'error': f'Gemini image analysis failed: {str(exc)}'
+            }), 500
+
+        # Validate CSV header and extract rows
+        parsed_rows = []
+        reader = csv.reader(io.StringIO(csv_output))
+        try:
+            header = next(reader)
+        except StopIteration:
+            header = []
+
+        header = [h.strip().lower() for h in header]
+
+        if header[:2] != ['time_min', 'temp_c']:
+            # If header isn't as expected, still store raw output but mark analysis as failed
+            analysis_result = AnalysisResult(
+                file_id=file_id,
+                analysis_type='image',
+                compliant=False,
+                summary='Gemini output did not match expected CSV header (time_min,temp_c).',
+                raw_data=json.dumps({'gemini_csv': csv_output})
+            )
+            db.session.add(analysis_result)
+            db.session.commit()
+
+            return jsonify({
+                'success': False,
+                'error': 'Gemini output did not contain expected CSV header time_min,temp_c.',
+                'analysis': analysis_result.to_dict()
+            }), 500
+
+        for row_num, row in enumerate(reader, start=2):
+            if not row or len(row) < 2:
+                continue
+            try:
+                time_min = float(row[0])
+                temp_c = float(row[1])
+                parsed_rows.append({'time_min': time_min, 'temp_c': temp_c, 'row': row_num})
+            except Exception:
+                continue
+
+        # Build analysis result and violations based on temperature rules
+        analysis_result = AnalysisResult(
+            file_id=file_id,
+            analysis_type='image',
+            compliant=True,
+            summary='Image analyzed with Gemini and validated against temperature rules.',
+            raw_data=json.dumps({'gemini_csv': csv_output, 'parsed_count': len(parsed_rows)})
+        )
+        db.session.add(analysis_result)
+        db.session.flush()
+
+        violations = []
+        for r in parsed_rows:
+            temp = r['temp_c']
+            if temp < 2.0 or temp > 8.0:
+                violation = Violation(
+                    analysis_result_id=analysis_result.id,
+                    regulation_code='REG-TEMP-1',
+                    regulation_title='Temperature within 2C-8C',
+                    regulation_text='Temperature must remain within 2°C to 8°C.',
+                    severity='critical',
+                    description=f'Temperature reading of {temp}C (from image row {r["row"]}) is outside allowed range.',
+                    evidence=f'Image CSV row {r["row"]}: time_min={r["time_min"]}, temp_c={temp}',
+                    timestamp=datetime.utcnow(),
+                    line_number=r['row']
+                )
+                db.session.add(violation)
+                violations.append(violation)
+
+            # Also store a LogEntry for timeline purposes
+            try:
+                ts = (uploaded_file.uploaded_at or datetime.utcnow()) + timedelta(minutes=r['time_min'])
+                log_entry = LogEntry(
+                    analysis_result_id=analysis_result.id,
+                    timestamp=ts,
+                    entry_type='TEMP_READING',
+                    value=str(r['temp_c']),
+                    raw_line=f'image_row_{r["row"]}',
+                    line_number=r['row']
+                )
+                db.session.add(log_entry)
+            except Exception:
+                pass
+
+        # Finalize compliance status
+        db.session.commit()
+
+        compliant = len(violations) == 0
+        analysis_result.compliant = compliant
+        analysis_result.summary = 'PASS' if compliant else f'FAIL: {len(violations)} violations detected from image CSV.'
+        db.session.add(analysis_result)
+        db.session.commit()
+
         return jsonify({
-            'success': False,
-            'error': 'Image analysis requires additional OCR/VLM setup. For this PoC, please use log files.'
-        }), 501
+            'success': True,
+            'analysis': analysis_result.to_dict(),
+            'violations': [v.to_dict() for v in analysis_result.violations],
+            'stats': {
+                'total_entries': len(parsed_rows),
+                'temp_readings': len(parsed_rows),
+                'violations_by_severity': {
+                    'critical': sum(1 for v in analysis_result.violations if v.severity == 'critical'),
+                    'major': sum(1 for v in analysis_result.violations if v.severity == 'major'),
+                    'warning': sum(1 for v in analysis_result.violations if v.severity == 'warning')
+                }
+            }
+        })
     
     return jsonify({'success': False, 'error': 'Unsupported file type'}), 400
 
@@ -259,6 +384,16 @@ def get_rules():
 @app.route('/api/download/csv/<int:analysis_id>', methods=['GET'])
 def download_csv(analysis_id):
     analysis = AnalysisResult.query.get_or_404(analysis_id)
+
+    if analysis.analysis_type == 'image' and analysis.raw_data:
+        raw_payload = json.loads(analysis.raw_data)
+        csv_content = raw_payload.get('gemini_csv', '')
+        if csv_content:
+            from flask import make_response
+            response = make_response(csv_content)
+            response.headers["Content-Disposition"] = f"attachment; filename=gemini_extracted_data_{analysis_id}.csv"
+            response.headers["Content-type"] = "text/csv"
+            return response
     
     csv_content = ReportGenerator.generate_csv(
         {'compliant': analysis.compliant, 'stats': json.loads(analysis.raw_data) if analysis.raw_data else {}},
