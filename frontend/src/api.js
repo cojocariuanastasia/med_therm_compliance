@@ -70,6 +70,20 @@ export const api = {
 
   getPdfDownloadUrl(analysisId) {
     return `${API_BASE}/download/pdf/${analysisId}`;
+  },
+
+  getLogsDownloadUrl(analysisId) {
+    return `${API_BASE}/download/logs/${analysisId}`;
+  },
+
+  async checkHasLogs(analysisId) {
+    const response = await axios.get(`${API_BASE}/analysis/${analysisId}/has-logs`);
+    return response.data;
+  },
+
+  async generateLogs(analysisId) {
+    const response = await axios.post(`${API_BASE}/analysis/${analysisId}/generate-logs`);
+    return response.data;
   }
 };
 

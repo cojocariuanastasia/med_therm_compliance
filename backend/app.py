@@ -12,6 +12,7 @@ from log_analyzer import ComplianceAnalyzer
 from report_generator import ReportGenerator
 from compliance_rules import get_all_rules
 from gemini_client import GeminiClient
+from ark_client import ArkClient
 
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -19,9 +20,28 @@ CORS(app)
 db.init_app(app)
 
 analyzer = ComplianceAnalyzer()
-# Allow GEMINI_MODEL to be a comma-separated list like "gemini-2.5-flash,gemini-2.0-flash"
 gemini_model_cfg = app.config.get('GEMINI_MODEL') or ''
 gemini_client = GeminiClient(app.config.get('GEMINI_API_KEY'), gemini_model_cfg)
+
+ark_api_key = app.config.get('ARK_API_KEY')
+ark_base_url = app.config.get('ARK_BASE_URL')
+ark_vision_model = app.config.get('ARK_VISION_MODEL')
+ark_text_model = app.config.get('ARK_TEXT_MODEL')
+ark_client = None
+if ark_api_key and ark_vision_model:
+    ark_client = ArkClient(ark_api_key, ark_base_url, ark_vision_model, ark_text_model)
+
+
+def extract_csv_from_image(image_path, mime_type):
+    if ark_client:
+        return ark_client.analyze_image_as_csv(image_path, mime_type)
+    return gemini_client.analyze_image_as_csv(image_path, mime_type)
+
+
+def generate_logs_from_csv(csv_data):
+    if ark_client:
+        return ark_client.generate_simulated_logs(csv_data)
+    return gemini_client.generate_simulated_logs(csv_data)
 
 def allowed_file(filename):
     return '.' in filename and \
@@ -174,11 +194,11 @@ def analyze_file(file_id):
     elif uploaded_file.file_type == 'image':
         try:
             mime_type = get_mime_type(uploaded_file.original_filename)
-            csv_output = gemini_client.analyze_image_as_csv(uploaded_file.file_path, mime_type=mime_type)
+            csv_output = extract_csv_from_image(uploaded_file.file_path, mime_type)
         except Exception as exc:
             return jsonify({
                 'success': False,
-                'error': f'Gemini image analysis failed: {str(exc)}'
+                'error': f'Image analysis failed: {str(exc)}'
             }), 500
 
         # Validate CSV header and extract rows
@@ -192,20 +212,20 @@ def analyze_file(file_id):
         header = [h.strip().lower() for h in header]
 
         if header[:2] != ['time_min', 'temp_c']:
-            # If header isn't as expected, still store raw output but mark analysis as failed
             analysis_result = AnalysisResult(
                 file_id=file_id,
                 analysis_type='image',
                 compliant=False,
-                summary='Gemini output did not match expected CSV header (time_min,temp_c).',
-                raw_data=json.dumps({'gemini_csv': csv_output})
+                summary='Output did not match expected CSV header (time_min,temp_c).',
+                gemini_csv=csv_output,
+                raw_data=json.dumps({'gemini_csv': csv_output, 'parsed_count': len(parsed_rows)})
             )
             db.session.add(analysis_result)
             db.session.commit()
 
             return jsonify({
                 'success': False,
-                'error': 'Gemini output did not contain expected CSV header time_min,temp_c.',
+                'error': 'Output did not contain expected CSV header time_min,temp_c.',
                 'analysis': analysis_result.to_dict()
             }), 500
 
@@ -219,72 +239,67 @@ def analyze_file(file_id):
             except Exception:
                 continue
 
-        # Build analysis result and violations based on temperature rules
+        # Generate simulated transport logs from CSV data
+        try:
+            simulated_logs = generate_logs_from_csv(csv_output)
+        except Exception as exc:
+            return jsonify({
+                'success': False,
+                'error': f'Log generation failed: {str(exc)}'
+            }), 500
+
+        # Analyze the simulated logs using the full log analyzer
+        result = analyzer.analyze_log_file(simulated_logs)
+
         analysis_result = AnalysisResult(
             file_id=file_id,
             analysis_type='image',
-            compliant=True,
-            summary='Image analyzed with Gemini and validated against temperature rules.',
-            raw_data=json.dumps({'gemini_csv': csv_output, 'parsed_count': len(parsed_rows)})
+            compliant=result['compliant'],
+            summary=result['summary'],
+            gemini_csv=csv_output,
+            simulated_logs=simulated_logs,
+            raw_data=json.dumps({
+                'parsed_count': len(parsed_rows),
+                'stats': result['stats']
+            })
         )
         db.session.add(analysis_result)
         db.session.flush()
 
-        violations = []
-        for r in parsed_rows:
-            temp = r['temp_c']
-            if temp < 2.0 or temp > 8.0:
-                violation = Violation(
-                    analysis_result_id=analysis_result.id,
-                    regulation_code='REG-TEMP-1',
-                    regulation_title='Temperature within 2C-8C',
-                    regulation_text='Temperature must remain within 2°C to 8°C.',
-                    severity='critical',
-                    description=f'Temperature reading of {temp}C (from image row {r["row"]}) is outside allowed range.',
-                    evidence=f'Image CSV row {r["row"]}: time_min={r["time_min"]}, temp_c={temp}',
-                    timestamp=datetime.utcnow(),
-                    line_number=r['row']
-                )
-                db.session.add(violation)
-                violations.append(violation)
+        for violation_data in result['violations']:
+            violation = Violation(
+                analysis_result_id=analysis_result.id,
+                regulation_code=violation_data['regulation_code'],
+                regulation_title=violation_data['regulation_title'],
+                regulation_text=violation_data['regulation_text'],
+                severity=violation_data['severity'],
+                description=violation_data['description'],
+                evidence=violation_data['evidence'],
+                timestamp=violation_data.get('timestamp'),
+                line_number=violation_data.get('line_number')
+            )
+            db.session.add(violation)
 
-            # Also store a LogEntry for timeline purposes
-            try:
-                ts = (uploaded_file.uploaded_at or datetime.utcnow()) + timedelta(minutes=r['time_min'])
+        for entry in result['entries']:
+            if entry.get('timestamp'):
                 log_entry = LogEntry(
                     analysis_result_id=analysis_result.id,
-                    timestamp=ts,
-                    entry_type='TEMP_READING',
-                    value=str(r['temp_c']),
-                    raw_line=f'image_row_{r["row"]}',
-                    line_number=r['row']
+                    timestamp=entry['timestamp'],
+                    entry_type=entry['entry_type'],
+                    value=str(entry['value']) if entry.get('value') else None,
+                    raw_line=entry['raw_line'],
+                    line_number=entry['line_number']
                 )
                 db.session.add(log_entry)
-            except Exception:
-                pass
 
-        # Finalize compliance status
-        db.session.commit()
-
-        compliant = len(violations) == 0
-        analysis_result.compliant = compliant
-        analysis_result.summary = 'PASS' if compliant else f'FAIL: {len(violations)} violations detected from image CSV.'
-        db.session.add(analysis_result)
         db.session.commit()
 
         return jsonify({
             'success': True,
             'analysis': analysis_result.to_dict(),
             'violations': [v.to_dict() for v in analysis_result.violations],
-            'stats': {
-                'total_entries': len(parsed_rows),
-                'temp_readings': len(parsed_rows),
-                'violations_by_severity': {
-                    'critical': sum(1 for v in analysis_result.violations if v.severity == 'critical'),
-                    'major': sum(1 for v in analysis_result.violations if v.severity == 'major'),
-                    'warning': sum(1 for v in analysis_result.violations if v.severity == 'warning')
-                }
-            }
+            'stats': result['stats'],
+            'simulated_logs_generated': True
         })
     
     return jsonify({'success': False, 'error': 'Unsupported file type'}), 400
@@ -385,9 +400,11 @@ def get_rules():
 def download_csv(analysis_id):
     analysis = AnalysisResult.query.get_or_404(analysis_id)
 
-    if analysis.analysis_type == 'image' and analysis.raw_data:
-        raw_payload = json.loads(analysis.raw_data)
-        csv_content = raw_payload.get('gemini_csv', '')
+    if analysis.analysis_type == 'image':
+        csv_content = analysis.gemini_csv
+        if not csv_content and analysis.raw_data:
+            raw_payload = json.loads(analysis.raw_data)
+            csv_content = raw_payload.get('gemini_csv', '')
         if csv_content:
             from flask import make_response
             response = make_response(csv_content)
@@ -406,6 +423,129 @@ def download_csv(analysis_id):
     response.headers["Content-Disposition"] = f"attachment; filename=compliance_report_{analysis_id}.csv"
     response.headers["Content-type"] = "text/csv"
     return response
+
+@app.route('/api/analysis/<int:analysis_id>/generate-logs', methods=['POST'])
+def generate_simulated_logs(analysis_id):
+    analysis = AnalysisResult.query.get_or_404(analysis_id)
+    
+    if analysis.analysis_type != 'image':
+        return jsonify({
+            'success': False,
+            'error': 'Simulated logs can only be generated for image analyses.'
+        }), 400
+
+    uploaded_file = analysis.uploaded_file
+
+    raw_payload = {}
+    if analysis.raw_data:
+        raw_payload = json.loads(analysis.raw_data)
+
+    csv_output = analysis.gemini_csv or raw_payload.get('gemini_csv', '')
+
+    if not csv_output:
+        try:
+            mime_type = get_mime_type(uploaded_file.original_filename)
+            csv_output = extract_csv_from_image(uploaded_file.file_path, mime_type)
+            analysis.gemini_csv = csv_output
+            raw_payload['gemini_csv'] = csv_output
+        except Exception as exc:
+            return jsonify({
+                'success': False,
+                'error': f'Image analysis failed: {str(exc)}'
+            }), 500
+
+    try:
+        simulated_logs_txt = generate_logs_from_csv(csv_output)
+    except Exception as exc:
+        return jsonify({
+            'success': False,
+            'error': f'Gemini log generation failed: {str(exc)}'
+        }), 500
+
+    result = analyzer.analyze_log_file(simulated_logs_txt)
+
+    Violation.query.filter_by(analysis_result_id=analysis.id).delete()
+    LogEntry.query.filter_by(analysis_result_id=analysis.id).delete()
+
+    for violation_data in result['violations']:
+        violation = Violation(
+            analysis_result_id=analysis.id,
+            regulation_code=violation_data['regulation_code'],
+            regulation_title=violation_data['regulation_title'],
+            regulation_text=violation_data['regulation_text'],
+            severity=violation_data['severity'],
+            description=violation_data['description'],
+            evidence=violation_data['evidence'],
+            timestamp=violation_data.get('timestamp'),
+            line_number=violation_data.get('line_number')
+        )
+        db.session.add(violation)
+
+    for entry in result['entries']:
+        if entry.get('timestamp'):
+            log_entry = LogEntry(
+                analysis_result_id=analysis.id,
+                timestamp=entry['timestamp'],
+                entry_type=entry['entry_type'],
+                value=str(entry['value']) if entry.get('value') else None,
+                raw_line=entry['raw_line'],
+                line_number=entry['line_number']
+            )
+            db.session.add(log_entry)
+
+    analysis.simulated_logs = simulated_logs_txt
+    raw_payload['simulated_logs'] = simulated_logs_txt
+    raw_payload['stats'] = result['stats']
+    analysis.raw_data = json.dumps(raw_payload)
+    analysis.compliant = result['compliant']
+    analysis.summary = result['summary']
+    db.session.add(analysis)
+    db.session.commit()
+
+    return jsonify({
+        'success': True,
+        'analysis': analysis.to_dict(),
+        'violations': [v.to_dict() for v in analysis.violations],
+        'stats': result['stats'],
+        'simulated_logs_generated': True
+    })
+
+@app.route('/api/analysis/<int:analysis_id>/has-logs', methods=['GET'])
+def check_has_simulated_logs(analysis_id):
+    analysis = AnalysisResult.query.get_or_404(analysis_id)
+    
+    has_logs = False
+    if analysis.analysis_type == 'image':
+        has_logs = bool(analysis.simulated_logs)
+        if not has_logs and analysis.raw_data:
+            raw_payload = json.loads(analysis.raw_data)
+            has_logs = bool(raw_payload.get('simulated_logs', ''))
+    
+    return jsonify({
+        'success': True,
+        'has_simulated_logs': has_logs
+    })
+
+@app.route('/api/download/logs/<int:analysis_id>', methods=['GET'])
+def download_simulated_logs(analysis_id):
+    analysis = AnalysisResult.query.get_or_404(analysis_id)
+
+    if analysis.analysis_type == 'image':
+        logs_content = analysis.simulated_logs
+        if not logs_content and analysis.raw_data:
+            raw_payload = json.loads(analysis.raw_data)
+            logs_content = raw_payload.get('simulated_logs', '')
+        if logs_content:
+            from flask import make_response
+            response = make_response(logs_content)
+            response.headers["Content-Disposition"] = f"attachment; filename=simulated_transport_logs_{analysis_id}.txt"
+            response.headers["Content-type"] = "text/plain"
+            return response
+
+    return jsonify({
+        'success': False,
+        'error': 'No simulated logs available for this analysis.'
+    }), 404
 
 @app.route('/api/download/pdf/<int:analysis_id>', methods=['GET'])
 def download_pdf(analysis_id):

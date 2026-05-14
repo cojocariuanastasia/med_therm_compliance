@@ -39,6 +39,8 @@ class AnalysisResult(db.Model):
     summary = db.Column(db.Text)
     analyzed_at = db.Column(db.DateTime, default=datetime.utcnow)
     raw_data = db.Column(db.Text)
+    gemini_csv = db.Column(db.Text)
+    simulated_logs = db.Column(db.Text)
     
     violations = db.relationship('Violation', backref='analysis_result', lazy=True, cascade='all, delete-orphan')
     log_entries = db.relationship('LogEntry', backref='analysis_result', lazy=True, cascade='all, delete-orphan')

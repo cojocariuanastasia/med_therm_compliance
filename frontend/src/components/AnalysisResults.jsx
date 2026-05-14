@@ -11,6 +11,8 @@ export default function AnalysisResults({ file, onBack }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [activeTab, setActiveTab] = useState('summary');
+  const [hasSimulatedLogs, setHasSimulatedLogs] = useState(false);
+  const [generatingLogs, setGeneratingLogs] = useState(false);
 
   useEffect(() => {
     loadAnalysis();
@@ -32,6 +34,13 @@ export default function AnalysisResults({ file, onBack }) {
           if (timelineResult.success) {
             setTimeline(timelineResult.timeline);
           }
+
+          if (result.analysis.analysis_type === 'image') {
+            const logsResult = await api.checkHasLogs(result.analysis.id);
+            if (logsResult.success) {
+              setHasSimulatedLogs(logsResult.has_simulated_logs);
+            }
+          }
         }
       } else {
         setError(result.error || 'Analysis failed');
@@ -40,6 +49,31 @@ export default function AnalysisResults({ file, onBack }) {
       setError(err.response?.data?.error || 'Failed to analyze file');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleGenerateLogs = async () => {
+    if (!analysis) return;
+    
+    setGeneratingLogs(true);
+    try {
+      const result = await api.generateLogs(analysis.id);
+      if (result.success) {
+        setAnalysis(result.analysis);
+        setViolations(result.violations || []);
+        setHasSimulatedLogs(true);
+        
+        const timelineResult = await api.getTimeline(result.analysis.id);
+        if (timelineResult.success) {
+          setTimeline(timelineResult.timeline);
+        }
+      } else {
+        setError(result.error || 'Failed to generate logs');
+      }
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to generate logs');
+    } finally {
+      setGeneratingLogs(false);
     }
   };
 
@@ -128,6 +162,32 @@ export default function AnalysisResults({ file, onBack }) {
               <Download className="h-4 w-4" />
               <span>CSV</span>
             </a>
+            {analysis.analysis_type === 'image' && (
+              <>
+                {hasSimulatedLogs ? (
+                  <a
+                    href={api.getLogsDownloadUrl(analysis.id)}
+                    className="flex items-center space-x-2 px-4 py-2 border border-emerald-500 text-emerald-700 rounded-lg text-sm font-medium hover:bg-emerald-50 transition-colors"
+                  >
+                    <FileText className="h-4 w-4" />
+                    <span>Simulated Logs</span>
+                  </a>
+                ) : (
+                  <button
+                    onClick={handleGenerateLogs}
+                    disabled={generatingLogs}
+                    className="flex items-center space-x-2 px-4 py-2 bg-emerald-600 text-white rounded-lg text-sm font-medium hover:bg-emerald-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {generatingLogs ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <FileText className="h-4 w-4" />
+                    )}
+                    <span>{generatingLogs ? 'Generating...' : 'Generate Logs'}</span>
+                  </button>
+                )}
+              </>
+            )}
             <a
               href={api.getPdfDownloadUrl(analysis.id)}
               className="flex items-center space-x-2 px-4 py-2 bg-primary-600 text-white rounded-lg text-sm font-medium hover:bg-primary-700 transition-colors"

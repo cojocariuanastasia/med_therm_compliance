@@ -29,3 +29,7 @@ class Config:
     ALLOWED_EXTENSIONS = {'txt', 'png', 'jpg', 'jpeg'}
     GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
     GEMINI_MODEL = os.environ.get('GEMINI_MODEL') or 'gemini-2.5-flash'
+    ARK_API_KEY = os.environ.get('ARK_API_KEY')
+    ARK_BASE_URL = os.environ.get('ARK_BASE_URL') or 'https://ark.ap-southeast.bytepluses.com/api/v3'
+    ARK_VISION_MODEL = os.environ.get('ARK_VISION_MODEL')
+    ARK_TEXT_MODEL = os.environ.get('ARK_TEXT_MODEL')
